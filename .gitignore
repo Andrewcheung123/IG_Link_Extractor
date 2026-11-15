@@ -1,0 +1,7 @@
+# Instagram sign-in session: never commit
+.ig-profile/
+# Built from reader.swift (swiftc -O reader.swift -o reader)
+reader
+# Downloaded post media
+videos/
+.DS_Store
