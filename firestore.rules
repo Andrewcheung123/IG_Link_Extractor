@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+match /databases/{db}/documents {
+// Todo List app (same project): keep exactly as deployed.
+match /lists/{uid} {
+allow get: if request.auth != null && request.auth.uid == uid;
+allow create, update: if request.auth != null && request.auth.uid == uid && request.resource.data.keys().hasOnly(['tasks', 'updated']);
+}
+
+// IG Link Extractor inbox: each signed-in user has a private queue; the Mac only reads its owner's.
+match /inbox/{uid}/links/{id} {
+allow read, delete: if request.auth != null && request.auth.uid == uid;
+allow create: if request.auth != null && request.auth.uid == uid
+  && request.resource.data.keys().hasOnly(['url', 'status', 'createdAt'])
+  && request.resource.data.url is string && request.resource.data.url.size() <= 300
+  && request.resource.data.url.matches('https://(www[.])?instagram[.]com/.+')
+  && request.resource.data.status == 'queued'
+  && request.resource.data.createdAt == request.time;
+allow update: if request.auth != null && request.auth.uid == uid
+  && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'note'])
+  && request.resource.data.status in ['saving', 'saved', 'error']
+  && request.resource.data.get('note', '') is string && request.resource.data.get('note', '').size() <= 500;
+}
+}
+}

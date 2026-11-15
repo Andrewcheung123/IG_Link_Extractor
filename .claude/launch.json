@@ -6,6 +6,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["server.js"],
       "port": 3210
+    },
+    {
+      "name": "phone-inbox",
+      "runtimeExecutable": "firebase",
+      "runtimeArgs": ["serve", "--only", "hosting:ig", "--port", "5055"],
+      "port": 5055
     }
   ]
 }

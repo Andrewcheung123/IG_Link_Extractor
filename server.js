@@ -56,10 +56,20 @@ function openSignInBrowser() {
 
 // Runs a script inside the signed-in instagram.com tab, so requests carry the user's own session.
 async function evalInInstagramTab(expression) {
-  const tabs = await fetch(`${CDP}/json`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json())
+  const list = () => fetch(`${CDP}/json`, { signal: AbortSignal.timeout(1500) }).then((r) => r.json())
     .catch(() => { throw new Error('sign-in browser is not open'); });
-  const tab = tabs.find((t) => t.type === 'page' && t.url.startsWith('https://www.instagram.com/'));
-  if (!tab) throw new Error('no instagram.com tab in the sign-in browser');
+  const isIg = (t) => t.type === 'page' && t.url.startsWith('https://www.instagram.com/');
+  let tab = (await list()).find(isIg);
+  if (!tab) {
+    // The window is often reused for this console, so open an instagram.com tab instead of falling back to
+    // the public page (which has no videos). Requests then carry the signed-in session again.
+    await fetch(`${CDP}/json/new?https://www.instagram.com/`, { method: 'PUT', signal: AbortSignal.timeout(3000) });
+    for (let i = 0; i < 20 && !tab; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      tab = (await list()).find(isIg);
+    }
+    if (!tab) throw new Error('could not open instagram.com in the sign-in browser');
+  }
   const ws = new WebSocket(tab.webSocketDebuggerUrl);
   let timer;
   try {
@@ -250,7 +260,58 @@ const PAGE = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="v
 <option value="">Auto (guess from caption)</option><option value="en-US">English</option><option value="zh-TW">國語 Mandarin</option><option value="zh-HK">粵語 Cantonese</option></select></p>
 <p><button id="login" type="button" style="background:#e5e5ea;color:#1d1d1f">Open sign-in browser</button>
 <small> Optional: sign in there once to read private posts, all images and comments. Keep that window open.</small></p>
+<p><button id="inbox" type="button" style="background:#e5e5ea;color:#1d1d1f">Connect phone inbox</button>
+<small id="inboxStatus"> Links sent from <a href="https://my-project-ig-link-extractor.web.app">your phone</a> are saved here while this page stays open.</small></p>
 <p id="status" role="status"></p><div id="out"></div>
+<script type="module">
+// Phone inbox (Firebase). If it cannot load, pasting links on this page still works.
+let fb;
+try {
+  const { firebaseConfig, SDK } = await import('/firebase-config.js');
+  const [a, au, fs] = await Promise.all(['app', 'auth', 'firestore'].map((m) => import(SDK + '/firebase-' + m + '.js')));
+  fb = { a, au, fs, config: firebaseConfig };
+} catch (err) {
+  document.getElementById('inbox').disabled = true;
+  document.getElementById('inboxStatus').textContent = ' Phone inbox unavailable (offline?). Pasting links here still works.';
+}
+if (fb) {
+  const { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged } = fb.au;
+  const { getFirestore, collection, query, where, onSnapshot, runTransaction, updateDoc } = fb.fs;
+  const app = fb.a.initializeApp(fb.config), auth = getAuth(app), db = getFirestore(app);
+  const st = document.getElementById('inboxStatus'), btn = document.getElementById('inbox');
+  btn.onclick = () => signInWithPopup(auth, new GoogleAuthProvider()).catch((e) => { st.textContent = ' ' + e.message; });
+  let chain = Promise.resolve();
+  const seen = new Set();
+  onAuthStateChanged(auth, (user) => {
+    if (!user) return;
+    btn.hidden = true; st.textContent = 'Phone inbox connected (' + user.email + '). Keep this page open.';
+    onSnapshot(query(collection(db, 'inbox', user.uid, 'links'), where('status', '==', 'queued')), (snap) => {
+      const time = (d) => (d.data().createdAt ? d.data().createdAt.toMillis() : 0);
+      for (const d of snap.docs.filter((d) => !seen.has(d.id)).sort((x, y) => time(x) - time(y))) {
+        seen.add(d.id); chain = chain.then(() => take(d.ref));
+      }
+    });
+  });
+  // One link at a time: bulk fetching can get the Instagram account flagged.
+  // The transaction stops two open tabs from saving the same link twice. Failures are marked, never retried.
+  async function take(ref) {
+    const url = await runTransaction(db, async (t) => {
+      const s = await t.get(ref);
+      if (!s.exists() || s.data().status !== 'queued') return null;
+      t.update(ref, { status: 'saving' }); return s.data().url;
+    }).catch(() => null);
+    if (!url) return;
+    st.textContent = 'Saving from phone: ' + url;
+    let d;
+    try {
+      d = await (await fetch('/extract', { method: 'POST', body: JSON.stringify({ url, folder: document.getElementById('folder').value, lang: document.getElementById('lang').value }) })).json();
+    } catch (err) { d = { error: 'Console server not reachable.' }; }
+    const title = d.post && d.post.summary ? d.post.summary.title : '';
+    await updateDoc(ref, d.error ? { status: 'error', note: String(d.error).slice(0, 500) } : { status: 'saved', note: String(title).slice(0, 500) }).catch(() => {});
+    st.textContent = 'Phone inbox connected. Last: ' + (d.error ? 'failed (' + d.error + ')' : 'saved ' + url);
+  }
+}
+</script>
 <script>
 const folder = document.getElementById('folder');
 fetch('/folders').then((r) => r.json()).then((list) => {
@@ -301,6 +362,10 @@ function serve() {
       return json(out);
     }
     if (req.url === '/folders') return json(await listFolders().catch(() => []));
+    if (req.url === '/firebase-config.js') {
+      res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
+      return res.end(fs.readFileSync(path.join(__dirname, 'public', 'firebase-config.js')));
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE);
   }).listen(PORT, '127.0.0.1', () => console.log(`IG console: http://127.0.0.1:${PORT}`));

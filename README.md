@@ -40,6 +40,18 @@ Then open http://127.0.0.1:3210 in any browser.
 
 Without signing in, only public posts work, with the caption and first image.
 
+## Send links from your phone
+
+1. On your phone, open https://my-project-ig-link-extractor.web.app, sign in with Google, and paste links there.
+2. On the Mac, open the console at **http://localhost:3210** (not 127.0.0.1: Google sign-in only works on
+   localhost) and press **Connect phone inbox** once, with the same Google account.
+3. While that page stays open, links from your phone are saved to Notes one by one, into the folder and
+   speech language chosen on the page. The phone page shows each link as saved or failed.
+
+Links sent while the Mac is off wait until the page is open again. Failed links are not retried; send them again.
+Deploy changes to the phone page or the database rules with `firebase deploy --only firestore:rules,hosting:ig`
+(the rules file also holds the Todo List app's rules, so keep those in it).
+
 ## Good to know
 
 - Your Instagram sign-in is stored in a hidden `.ig-profile` folder created next to these files.

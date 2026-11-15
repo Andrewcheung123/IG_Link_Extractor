@@ -5,3 +5,4 @@ reader
 # Downloaded post media
 videos/
 .DS_Store
+.firebase/

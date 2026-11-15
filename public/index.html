@@ -1,0 +1,58 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IG Link Inbox</title>
+<style>
+  body{font:16px/1.5 -apple-system,"PingFang TC",sans-serif;max-width:680px;margin:32px auto;padding:0 16px;color:#1d1d1f;background:#f5f5f7}
+  form{display:flex;gap:8px} input{flex:1;min-width:0;padding:10px 12px;font:inherit;border:1px solid #c7c7cc;border-radius:8px}
+  button{padding:10px 16px;font:inherit;border:0;border-radius:8px;background:#0071e3;color:#fff;cursor:pointer} button:disabled{opacity:.5}
+  .err{color:#c00} ul{list-style:none;padding:0} li{background:#fff;border-radius:10px;padding:10px 12px;margin:8px 0;overflow-wrap:anywhere}
+  small{color:#6e6e73} [hidden]{display:none!important}
+</style>
+<h1>IG Link Inbox</h1>
+<p><small>Paste an Instagram link. Your Mac saves it to Apple Notes the next time the IG Link Console is open there.</small></p>
+<p id="out"><button id="in" type="button">Sign in with Google</button></p>
+<div id="app" hidden>
+  <form id="f"><label for="u" hidden>Instagram link</label>
+  <input id="u" type="url" required placeholder="https://www.instagram.com/p/…"><button>Send to Mac</button></form>
+  <p id="status" role="status"></p>
+  <ul id="list"></ul>
+  <p><small id="who"></small> · <a href="#" id="outLink">Sign out</a></p>
+</div>
+<script type="module">
+import { firebaseConfig, SDK } from './firebase-config.js';
+const { initializeApp } = await import(`${SDK}/firebase-app.js`);
+const { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged, signOut } = await import(`${SDK}/firebase-auth.js`);
+const { getFirestore, collection, addDoc, serverTimestamp, query, orderBy, limit, onSnapshot } = await import(`${SDK}/firebase-firestore.js`);
+
+const app = initializeApp(firebaseConfig), auth = getAuth(app), db = getFirestore(app);
+const $ = (id) => document.getElementById(id);
+const LABEL = { queued: 'Waiting for Mac', saving: 'Saving…', saved: 'Saved to Notes', error: 'Failed' };
+let stop = () => {};
+
+// Popup, not redirect: redirect breaks on iPhone Safari when authDomain is another domain.
+$('in').onclick = () => signInWithPopup(auth, new GoogleAuthProvider()).catch((e) => { $('status').textContent = e.message; });
+$('outLink').onclick = (e) => { e.preventDefault(); signOut(auth); };
+
+onAuthStateChanged(auth, (user) => {
+  stop();
+  $('out').hidden = !!user; $('app').hidden = !user;
+  if (!user) return;
+  $('who').textContent = user.email;
+  const links = collection(db, 'inbox', user.uid, 'links');
+  $('f').onsubmit = async (e) => {
+    e.preventDefault();
+    const s = $('status'); s.className = '';
+    try {
+      await addDoc(links, { url: $('u').value.trim(), status: 'queued', createdAt: serverTimestamp() });
+      $('u').value = ''; s.textContent = 'Sent. It will be saved when your Mac picks it up.';
+    } catch (err) { s.className = 'err'; s.textContent = 'Not sent: only instagram.com post links are accepted.'; }
+  };
+  stop = onSnapshot(query(links, orderBy('createdAt', 'desc'), limit(20)), (snap) => {
+    $('list').replaceChildren(...snap.docs.map((d) => {
+      const x = d.data(), li = document.createElement('li');
+      li.textContent = `${LABEL[x.status] || x.status} — ${x.url}${x.note ? '\n' + x.note : ''}`;
+      li.style.whiteSpace = 'pre-wrap'; if (x.status === 'error') li.className = 'err';
+      return li;
+    }));
+  });
+});
+</script></html>
