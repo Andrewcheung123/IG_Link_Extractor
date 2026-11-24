@@ -48,6 +48,11 @@ Without signing in, only public posts work, with the caption and first image.
 3. While that page stays open, links from your phone are saved to Notes one by one, into the folder and
    speech language chosen on the page. The phone page shows each link as saved or failed.
 
+The console server starts at login and restarts if it stops, via `~/Library/LaunchAgents/local.ig-link-console.plist`
+(log: `~/Library/Logs/ig-link-console.log`). If you move this folder, update the two paths in that file, then run
+`launchctl bootout gui/$(id -u)/local.ig-link-console; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/local.ig-link-console.plist`.
+Stop it for good with just the `bootout` part. While it runs, `node server.js` in Terminal fails (port 3210 already in use).
+
 Links sent while the Mac is off wait until the page is open again. Failed links are not retried; send them again.
 Deploy changes to the phone page or the database rules with `firebase deploy --only firestore:rules,hosting:ig`
 (the rules file also holds the Todo List app's rules, so keep those in it).
