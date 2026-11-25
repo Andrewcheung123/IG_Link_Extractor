@@ -6,3 +6,5 @@ reader
 videos/
 .DS_Store
 .firebase/
+# Local backups (contain the whole repo)
+*-backup-*.zip

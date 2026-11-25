@@ -243,6 +243,83 @@ async function saveToNotes(html, folderId) {
   } finally { fs.unlinkSync(file); }
 }
 
+// The whole job for one link: read it, fetch media, summarise, save the note, attach media.
+async function saveLink({ url, folder, lang }) {
+  const out = {};
+  try {
+    out.post = await readPost(url);
+    const files = await fetchMedia(out.post, lang);
+    out.post.summary = await summarize(out.post, files);
+    const noteId = await saveToNotes(noteHtml(out.post), folder);
+    out.videos = await attachMedia(files, noteId);
+  } catch (err) { out.error = err.message; }
+  return out;
+}
+
+// Phone inbox, watched by this server so no browser page has to stay open. The console page hands over the
+// Firebase sign-in once (a refresh token); the server then reads the user's queue over Firestore's REST API as that
+// user, so firestore.rules still apply.
+const FB = Object.fromEntries(['apiKey', 'projectId'].map((k) => [k,
+  new RegExp(`${k}: '([^']+)'`).exec(fs.readFileSync(path.join(__dirname, 'public', 'firebase-config.js'), 'utf8'))[1]]));
+const FIRESTORE = 'https://firestore.googleapis.com/v1/';
+const INBOX_FILE = path.join(__dirname, '.ig-profile', 'inbox-token.json'); // gitignored and left out of backups: it is a sign-in
+const inbox = { status: 'Not connected. Press Connect phone inbox once.', connected: false, polling: false, dead: '', idToken: null };
+
+const loadInbox = () => { try { return JSON.parse(fs.readFileSync(INBOX_FILE, 'utf8')); } catch { return null; } };
+
+async function inboxToken(cfg) {
+  if (inbox.idToken && inbox.idToken.until > Date.now()) return inbox.idToken;
+  const r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${FB.apiKey}`, { method: 'POST',
+    body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: cfg.refreshToken }), signal: AbortSignal.timeout(15000) });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(d.error ? d.error.message : `sign-in check failed (${r.status})`), { signedOut: r.status >= 400 && r.status < 500 });
+  return (inbox.idToken = { token: d.id_token, uid: d.user_id, until: Date.now() + (Number(d.expires_in) - 300) * 1000 });
+}
+
+// Firestore REST rows -> queued links, oldest first. Rows without a document are query progress markers.
+const queuedLinks = (rows) => rows.filter((r) => r.document).map(({ document: d }) => ({
+  name: d.name, updateTime: d.updateTime, url: d.fields.url.stringValue, at: d.fields.createdAt ? d.fields.createdAt.timestampValue : '',
+})).sort((x, y) => x.at.localeCompare(y.at));
+const inboxFields = (status, note) => ({ fields: { status: { stringValue: status }, ...(note === undefined ? {} : { note: { stringValue: String(note).slice(0, 500) } }) } });
+
+// One link at a time (bulk fetching can get the Instagram account flagged). Failures are marked, never retried.
+async function pollInbox() {
+  const cfg = loadInbox();
+  if (inbox.polling || !cfg || cfg.refreshToken === inbox.dead) return;
+  inbox.polling = true;
+  try {
+    const call = async (url, method, body) => {
+      const { token } = await inboxToken(cfg);
+      return fetch(url, { method, body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' } });
+    };
+    const { uid } = await inboxToken(cfg);
+    const r = await call(`${FIRESTORE}projects/${FB.projectId}/databases/(default)/documents/inbox/${uid}:runQuery`, 'POST', { structuredQuery: {
+      from: [{ collectionId: 'links' }], where: { fieldFilter: { field: { fieldPath: 'status' }, op: 'EQUAL', value: { stringValue: 'queued' } } } } });
+    if (!r.ok) throw new Error(`inbox check failed (${r.status})`);
+    if (!inbox.connected) console.log('phone inbox connected');
+    Object.assign(inbox, { connected: true });
+    if (!inbox.status.startsWith('Connected.')) inbox.status = 'Connected. Links from your phone are saved while this Mac is on; this page can be closed.';
+    for (const link of queuedLinks(await r.json())) {
+      // Claim it only if nobody changed it since the query, so two workers never save the same link.
+      const claim = await call(`${FIRESTORE}${link.name}?updateMask.fieldPaths=status&currentDocument.updateTime=${encodeURIComponent(link.updateTime)}`,
+        'PATCH', inboxFields('saving'));
+      if (!claim.ok) continue;
+      inbox.status = `Connected. Saving from phone: ${link.url}`;
+      const out = await saveLink({ url: link.url, folder: cfg.folder, lang: cfg.lang });
+      await call(`${FIRESTORE}${link.name}?updateMask.fieldPaths=status&updateMask.fieldPaths=note`, 'PATCH',
+        inboxFields(out.error ? 'error' : 'saved', out.error || (out.post.summary ? out.post.summary.title : '')));
+      inbox.status = `Connected. Last from phone: ${out.error ? `failed (${out.error})` : `saved ${link.url}`}`;
+    }
+  } catch (err) {
+    if (err.signedOut) {
+      inbox.dead = cfg.refreshToken;
+      Object.assign(inbox, { connected: false, idToken: null, status: `Signed out (${err.message}). Press Connect phone inbox again.` });
+      console.log('phone inbox stopped:', err.message);
+    } else if (!inbox.status.includes('offline')) inbox.status = `Connected, but cannot reach Firebase right now (offline?): ${err.message}`;
+  } finally { inbox.polling = false; }
+}
+
 const PAGE = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>IG Link Console</title>
 <style>
@@ -261,56 +338,35 @@ const PAGE = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="v
 <p><button id="login" type="button" style="background:#e5e5ea;color:#1d1d1f">Open sign-in browser</button>
 <small> Optional: sign in there once to read private posts, all images and comments. Keep that window open.</small></p>
 <p><button id="inbox" type="button" style="background:#e5e5ea;color:#1d1d1f">Connect phone inbox</button>
-<small id="inboxStatus"> Links sent from <a href="https://my-project-ig-link-extractor.web.app">your phone</a> are saved here while this page stays open.</small></p>
+<small> Links sent from <a href="https://my-project-ig-link-extractor.web.app">your phone</a> are saved while this Mac is on.</small>
+<small id="inboxStatus"></small></p>
 <p id="status" role="status"></p><div id="out"></div>
 <script type="module">
 // Phone inbox (Firebase). If it cannot load, pasting links on this page still works.
 let fb;
 try {
   const { firebaseConfig, SDK } = await import('/firebase-config.js');
-  const [a, au, fs] = await Promise.all(['app', 'auth', 'firestore'].map((m) => import(SDK + '/firebase-' + m + '.js')));
-  fb = { a, au, fs, config: firebaseConfig };
+  const [a, au] = await Promise.all(['app', 'auth'].map((m) => import(SDK + '/firebase-' + m + '.js')));
+  fb = { a, au, config: firebaseConfig };
 } catch (err) {
   document.getElementById('inbox').disabled = true;
-  document.getElementById('inboxStatus').textContent = ' Phone inbox unavailable (offline?). Pasting links here still works.';
 }
+const st = document.getElementById('inboxStatus'), btn = document.getElementById('inbox');
 if (fb) {
   const { getAuth, GoogleAuthProvider, signInWithPopup, onAuthStateChanged } = fb.au;
-  const { getFirestore, collection, query, where, onSnapshot, runTransaction, updateDoc } = fb.fs;
-  const app = fb.a.initializeApp(fb.config), auth = getAuth(app), db = getFirestore(app);
-  const st = document.getElementById('inboxStatus'), btn = document.getElementById('inbox');
+  const auth = getAuth(fb.a.initializeApp(fb.config));
   btn.onclick = () => signInWithPopup(auth, new GoogleAuthProvider()).catch((e) => { st.textContent = ' ' + e.message; });
-  let chain = Promise.resolve();
-  const seen = new Set();
-  onAuthStateChanged(auth, (user) => {
-    if (!user) return;
-    btn.hidden = true; st.textContent = 'Phone inbox connected (' + user.email + '). Keep this page open.';
-    onSnapshot(query(collection(db, 'inbox', user.uid, 'links'), where('status', '==', 'queued')), (snap) => {
-      const time = (d) => (d.data().createdAt ? d.data().createdAt.toMillis() : 0);
-      for (const d of snap.docs.filter((d) => !seen.has(d.id)).sort((x, y) => time(x) - time(y))) {
-        seen.add(d.id); chain = chain.then(() => take(d.ref));
-      }
-    });
-  });
-  // One link at a time: bulk fetching can get the Instagram account flagged.
-  // The transaction stops two open tabs from saving the same link twice. Failures are marked, never retried.
-  async function take(ref) {
-    const url = await runTransaction(db, async (t) => {
-      const s = await t.get(ref);
-      if (!s.exists() || s.data().status !== 'queued') return null;
-      t.update(ref, { status: 'saving' }); return s.data().url;
-    }).catch(() => null);
-    if (!url) return;
-    st.textContent = 'Saving from phone: ' + url;
-    let d;
-    try {
-      d = await (await fetch('/extract', { method: 'POST', body: JSON.stringify({ url, folder: document.getElementById('folder').value, lang: document.getElementById('lang').value }) })).json();
-    } catch (err) { d = { error: 'Console server not reachable.' }; }
-    const title = d.post && d.post.summary ? d.post.summary.title : '';
-    await updateDoc(ref, d.error ? { status: 'error', note: String(d.error).slice(0, 500) } : { status: 'saved', note: String(title).slice(0, 500) }).catch(() => {});
-    st.textContent = 'Phone inbox connected. Last: ' + (d.error ? 'failed (' + d.error + ')' : 'saved ' + url);
-  }
+  // The server watches the inbox itself; this hands it the sign-in and the chosen folder and language.
+  const handOver = () => auth.currentUser && fetch('/inbox-token', { method: 'POST', body: JSON.stringify({
+    refreshToken: auth.currentUser.refreshToken, folder: localStorage.igFolder || '', lang: localStorage.igLang || '' }) })
+    .then((r) => r.json()).then(showInbox).catch(() => {});
+  onAuthStateChanged(auth, handOver);
+  for (const id of ['folder', 'lang']) document.getElementById(id).addEventListener('change', handOver);
 }
+function showInbox() {
+  fetch('/inbox-status').then((r) => r.json()).then((d) => { st.textContent = ' ' + d.status; btn.hidden = d.connected; }).catch(() => {});
+}
+showInbox(); setInterval(showInbox, 5000);
 </script>
 <script>
 const folder = document.getElementById('folder');
@@ -347,20 +403,29 @@ function serve() {
     if (req.method === 'POST' && req.url === '/login') {
       try { openSignInBrowser(); return json({}); } catch (err) { return json({ error: err.message }); }
     }
-    if (req.method === 'POST' && req.url === '/extract') {
+    const readJson = async () => {
       let body = '';
       for await (const chunk of req) { body += chunk; if (body.length > 4096) break; }
-      const out = {};
-      try {
-        const { url, folder, lang } = JSON.parse(body);
-        out.post = await readPost(url);
-        const files = await fetchMedia(out.post, lang);
-        out.post.summary = await summarize(out.post, files);
-        const noteId = await saveToNotes(noteHtml(out.post), folder);
-        out.videos = await attachMedia(files, noteId);
-      } catch (err) { out.error = err.message; }
-      return json(out);
+      return JSON.parse(body);
+    };
+    if (req.method === 'POST' && req.url === '/extract') {
+      let args;
+      try { args = await readJson(); } catch { return json({ error: 'Bad request.' }); }
+      return json(await saveLink(args));
     }
+    if (req.method === 'POST' && req.url === '/inbox-token') {
+      try {
+        const { refreshToken, folder, lang } = await readJson();
+        if (typeof refreshToken !== 'string' || !refreshToken || typeof folder !== 'string' || typeof lang !== 'string') throw new Error('bad request');
+        fs.mkdirSync(path.dirname(INBOX_FILE), { recursive: true });
+        fs.writeFileSync(INBOX_FILE, JSON.stringify({ refreshToken, folder, lang }), { mode: 0o600 });
+        Object.assign(inbox, { dead: '', idToken: null });
+        await inboxToken(loadInbox()); // fails fast on a bad sign-in; saving runs in the background
+        pollInbox();
+      } catch (err) { Object.assign(inbox, { connected: false, status: `Could not connect: ${err.message}` }); }
+      return json({ status: inbox.status, connected: inbox.connected });
+    }
+    if (req.url === '/inbox-status') return json({ status: inbox.status, connected: inbox.connected });
     if (req.url === '/folders') return json(await listFolders().catch(() => []));
     if (req.url === '/firebase-config.js') {
       res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
@@ -369,6 +434,8 @@ function serve() {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE);
   }).listen(PORT, '127.0.0.1', () => console.log(`IG console: http://127.0.0.1:${PORT}`));
+  // 20 s keeps reads near 4,300 a day (Firestore free tier is 50,000, shared with the Todo List app).
+  pollInbox(); setInterval(pollInbox, 20000);
 }
 
 function selfCheck() {
@@ -387,6 +454,13 @@ function selfCheck() {
   assert.ok(!noteHtml({ ...a, url: 'u', posted: '2019-01-04T17:05:45.000Z' }).includes('<img'));
   assert.deepEqual(parseSummary('標題  \n- 重點一\n\n- point two'), { title: '標題', points: ['重點一', 'point two'] });
   assert.equal(parseSummary(''), null);
+  const doc = (id, at, status) => ({ document: { name: `n/${id}`, updateTime: 'u', fields: { url: { stringValue: id }, status: { stringValue: status },
+    ...(at ? { createdAt: { timestampValue: at } } : {}) } } });
+  assert.deepEqual(queuedLinks([doc('b', '2026-11-25T02:00:00Z', 'queued'), { readTime: 'x' }, doc('a', '2026-11-25T01:00:00Z', 'queued'), doc('c', '', 'queued')])
+    .map((l) => l.url), ['c', 'a', 'b']);
+  assert.deepEqual(inboxFields('error', 'x'.repeat(600)).fields.note.stringValue.length, 500);
+  assert.deepEqual(Object.keys(inboxFields('saving').fields), ['status']);
+  assert.ok(/^AIza/.test(FB.apiKey) && FB.projectId === 'my-project-a3cb8');
   assert.equal(parseSummary('**Bold Title**\n- a').title, 'Bold Title');
   assert.ok(noteHtml({ ...a, summary: { title: 'T', points: ['P'] }, url: 'u', posted: '2019-01-04T17:05:45.000Z' }).includes('<h1>T</h1></div><div>• P</div>'));
   console.log('self-check ok');
