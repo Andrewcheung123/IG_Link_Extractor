@@ -121,8 +121,17 @@ async function readPublic(code) {
   return post;
 }
 
+// The phone's Share button gives instagram.com/share/<id> links, which redirect to the real /reel/ or /p/ address.
+const isShareLink = (link) => /^https?:\/\/(?:www\.)?instagram\.com\/share\/(?:\w+\/)?[\w-]+\/?(?:[?#].*)?$/.test(String(link).trim());
+async function resolveShare(link) {
+  // Browser user agents get a page instead of the redirect.
+  const r = await fetch(String(link).trim(), { redirect: 'manual', headers: { 'User-Agent': 'facebookexternalhit/1.1' }, signal: AbortSignal.timeout(15000) })
+    .catch(() => { throw new Error('Could not open the Instagram share link (offline?).'); });
+  return r.headers.get('location') || '';
+}
+
 async function readPost(link) {
-  const code = shortcodeOf(link);
+  const code = shortcodeOf(isShareLink(link) ? await resolveShare(link) : link);
   if (!code) throw new Error('That does not look like an Instagram post or reel link.');
   let post, mode = 'signed-in';
   try { post = await readSignedIn(code); } catch (why) {
@@ -442,6 +451,8 @@ function selfCheck() {
   assert.equal(shortcodeOf('https://www.instagram.com/p/BsOGulcndj-/?igsh=x'), 'BsOGulcndj-');
   assert.equal(shortcodeOf('https://instagram.com/someone/reel/Cabc_123/'), 'Cabc_123');
   assert.equal(shortcodeOf('https://evil.example/p/BsOGulcndj-/'), null);
+  assert.ok(isShareLink('https://www.instagram.com/share/_u2gE3dGR') && isShareLink('https://instagram.com/share/reel/BAae2EjQCe/?x=1'));
+  assert.ok(!isShareLink('https://evil.example/share/_u2gE3dGR') && !isShareLink('https://www.instagram.com/reel/Cabc_123/'));
   assert.equal(dateOf('BsOGulcndj-').toISOString().slice(0, 10), '2019-01-04');
   const p = parseEmbed('<div class="SocialProof"><a href="#">12 likes</a></div><div class="Caption"><a class="CaptionUsername" href="#">小明</a><br /><br />你好 &amp; hello<br /><a href="#">#標籤</a><div class="CaptionComments">');
   assert.deepEqual([p.username, p.caption, p.likes], ['小明', '你好 & hello\n#標籤', '12']);
